@@ -1,5 +1,6 @@
 //! Asynchronous client & synchronous client.
 
+use crate::channel::Change;
 #[cfg(feature = "raw-channel")]
 use crate::channel::Channel;
 use crate::error::{Error, Result};
@@ -49,11 +50,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::mpsc::Sender;
 
-#[cfg(any(feature = "tls-ring", feature = "tls-aws-lc"))]
-use tonic::transport::channel::Change;
 use tonic::transport::Endpoint;
-#[cfg(feature = "tls-openssl")]
-use tower::discover::Change;
 
 const HTTP_PREFIX: &str = "http://";
 const HTTPS_PREFIX: &str = "https://";

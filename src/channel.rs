@@ -2,12 +2,17 @@ use std::{future::Future, pin::Pin, task::ready};
 
 use http::Uri;
 use tokio::sync::mpsc::Sender;
-#[cfg(any(feature = "tls-ring", feature = "tls-aws-lc"))]
-use tonic::transport::channel::Change;
 use tonic::transport::Endpoint;
-#[cfg(feature = "tls-openssl")]
-use tower::discover::Change;
 use tower::{util::BoxCloneService, Service};
+
+/// A change in the service set.
+#[derive(Debug, Clone)]
+pub enum Change<K, V> {
+    /// A new service identified by key `K` was identified.
+    Insert(K, V),
+    /// The service identified by key `K` disappeared.
+    Remove(K),
+}
 
 /// A type alias to make the below types easier to represent.
 pub type EndpointUpdater = Sender<Change<Uri, Endpoint>>;
@@ -24,10 +29,8 @@ pub trait BalancedChannelBuilder {
 }
 
 /// Create a simple Tonic channel.
-#[cfg(any(feature = "tls-ring", feature = "tls-aws-lc"))]
 pub struct Tonic;
 
-#[cfg(any(feature = "tls-ring", feature = "tls-aws-lc"))]
 impl BalancedChannelBuilder for Tonic {
     type Error = tonic::transport::Error;
 
@@ -37,7 +40,22 @@ impl BalancedChannelBuilder for Tonic {
         buffer_size: usize,
     ) -> Result<(Channel, EndpointUpdater), Self::Error> {
         let (chan, tx) = tonic::transport::Channel::balance_channel(buffer_size);
-        Ok((Channel::Tonic(chan), tx))
+
+        let (bridge_tx, mut rx) = tokio::sync::mpsc::channel(buffer_size);
+        tokio::spawn(async move {
+            while let Some(change) = rx.recv().await {
+                let change = match change {
+                    Change::Insert(k, v) => tonic::transport::channel::Change::Insert(k, v),
+                    Change::Remove(k) => tonic::transport::channel::Change::Remove(k),
+                };
+
+                if let Err(_) = tx.send(change).await {
+                    break;
+                }
+            }
+        });
+
+        Ok((Channel::Tonic(chan), bridge_tx))
     }
 }
 
@@ -52,9 +70,26 @@ impl BalancedChannelBuilder for Openssl {
     type Error = crate::error::Error;
 
     #[inline]
-    fn balanced_channel(self, _: usize) -> Result<(Channel, EndpointUpdater), Self::Error> {
+    fn balanced_channel(
+        self,
+        buffer_size: usize,
+    ) -> Result<(Channel, EndpointUpdater), Self::Error> {
         let (chan, tx) = crate::openssl_tls::balanced_channel(self.conn)?;
-        Ok((Channel::Openssl(chan), tx))
+        let (bridge_tx, mut rx) = tokio::sync::mpsc::channel(buffer_size);
+        tokio::spawn(async move {
+            while let Some(change) = rx.recv().await {
+                let change = match change {
+                    Change::Insert(k, v) => tower::discover::Change::Insert(k, v),
+                    Change::Remove(k) => tower::discover::Change::Remove(k),
+                };
+
+                if let Err(_) = tx.send(change).await {
+                    break;
+                }
+            }
+        });
+
+        Ok((Channel::Openssl(chan), bridge_tx))
     }
 }
 
