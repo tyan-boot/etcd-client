@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use super::backoff::{BackOffStatus, BackOffWhenFail};
+use crate::error::Result;
 use http::{Request, Uri};
 use hyper_openssl::client::legacy::HttpsConnector;
 use hyper_util::client::legacy::connect::HttpConnector;
@@ -12,21 +13,18 @@ use openssl::{
 };
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio_stream::wrappers::ReceiverStream;
+use tonic::codegen::BoxFuture;
 use tonic::{
-    body::BoxBody,
+    body::Body,
     transport::{Channel, Endpoint},
 };
-use tower::{balance::p2c::Balance, buffer::Buffer, discover::Change};
-
-use crate::error::Result;
+use tower::{balance::p2c::Balance, buffer::Buffer, discover::Change, ServiceExt};
 
 pub type SslConnectorBuilder = openssl::ssl::SslConnectorBuilder;
 pub type OpenSslResult<T> = std::result::Result<T, ErrorStack>;
 // Below are some type alias for make clearer types.
-pub type TonicRequest = Request<BoxBody>;
-pub type Buffered<T> = Buffer<T, TonicRequest>;
-pub type Balanced<T> = Balance<T, TonicRequest>;
-pub type OpenSslChannel = Buffered<Balanced<OpenSslDiscover<Uri>>>;
+pub type TonicRequest = Request<Body>;
+pub type OpenSslChannel = Buffer<TonicRequest, BoxFuture<http::Response<Body>, tower::BoxError>>;
 /// OpenSslDiscover is the backend for balanced channel based on OpenSSL transports.
 /// Because `Channel::balance` doesn't allow us to provide custom connector, we must implement ourselves' balancer...
 pub type OpenSslDiscover<K> = ReceiverStream<Result<Change<K, BackOffWhenFail<Channel>>>>;
@@ -47,7 +45,7 @@ impl OpenSslConnector {
     }
 }
 
-#[cfg(feature = "tls")]
+#[cfg(any(feature = "tls-ring", feature = "tls-aws-lc"))]
 compile_error!(concat!(
     "**You should only enable one of `tls` and `tls-openssl`.** Reason: ",
     "For now, `tls-openssl` would take over the transport layer (sockets) to implement TLS based connection. ",
@@ -61,7 +59,7 @@ pub fn balanced_channel(
 ) -> Result<(OpenSslChannel, Sender<Change<Uri, Endpoint>>)> {
     let (tx, rx) = tokio::sync::mpsc::channel(16);
     let tls_conn = create_openssl_discover(connector, rx);
-    let balance = Balance::new(tls_conn);
+    let balance = Balance::new(tls_conn).boxed();
     // Note: the buffer should already be configured when creating the internal channels,
     // we wrap this in the buffer is just for making them `Clone`.
     let buffered = Buffer::new(balance, 1024);
